@@ -3,10 +3,11 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import morgan from 'morgan';
-import { AppDataSource } from './config/database';
 import organizationRouter from './controller/organization.controller';
 import userRouter from './controller/user.controller';
+import { createDataSource } from './config/database';
 dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -32,6 +33,8 @@ app.get('/health', (_req, res) => {
   res.send('Health check OK');
 });
 
+const AppDataSource = createDataSource();
+
 AppDataSource.initialize()
   .then(() => {
     console.log('Database connection established');
@@ -39,7 +42,7 @@ AppDataSource.initialize()
       console.log(`Server is running on port ${PORT}`);
     });
   })
-  .catch((error) => {
+  .catch((error: any) => {
     console.error('Error during database initialization:', error);
     process.exit(1);
   });

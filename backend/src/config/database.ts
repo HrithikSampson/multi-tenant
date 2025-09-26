@@ -7,16 +7,20 @@ import { ProjectMember } from '../entity/project-member.entity';
 import { Task } from '../entity/task.entity';
 import { Activity } from '../entity/activity.entity';
 
-export const AppDataSource = new DataSource({
-  type: 'postgres',
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432'),
-  username: process.env.DB_USERNAME || 'postgres',
-  password: process.env.DB_PASSWORD || 'password',
-  database: process.env.DB_NAME || 'multi_tenant',
-  entities: [User, Organization, OrgMembership, Project, ProjectMember, Task, Activity],
-  migrations: ['src/migrations/*.ts'],
-  synchronize: false,
-  logging: process.env.NODE_ENV === 'development',
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
+export const createDataSource = () => {
+  return new DataSource({
+    type: 'postgres',
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432'),
+    username: process.env.DB_USERNAME || 'postgres',
+    password: process.env.DB_PASSWORD || 'password',
+    database: process.env.DB_NAME || 'multi_tenant',
+    entities: [User, Organization, OrgMembership, Project, ProjectMember, Task, Activity],
+    migrations: ['src/migrations/*.ts'],
+    synchronize: false,
+    logging: process.env.NODE_ENV === 'development',
+    ssl: { rejectUnauthorized: false },
+  });
+};
+
+export const AppDataSource = createDataSource();
