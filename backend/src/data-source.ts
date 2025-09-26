@@ -22,4 +22,9 @@ export const AppDataSource = new DataSource({
   synchronize: false,
   logging: process.env.NODE_ENV === 'development',
   ssl: { rejectUnauthorized: false },
+  extra: {
+    connectionLimit: 1,
+    acquireTimeoutMillis: 30000,
+    timeout: 30000,
+  },
 });
