@@ -71,6 +71,11 @@ router.post('/', setOrganizationContext as any, requireOrganization as any, asyn
 // 2. List all projects in organization
 router.get('/', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
   try {
+    console.log('Projects GET request:', { 
+      userId: req.user?.userId, 
+      organizationId: req.organizationId,
+      headers: req.headers['x-organization-id']
+    });
     const projects = await executeWithRLS(req, `
       SELECT 
         p.id,

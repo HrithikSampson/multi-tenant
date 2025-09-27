@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { AppDataSource } from '../config/database';
+import { getInitializedDataSource } from '../config/database';
 import { User } from '../entity/user.entity';
 import logger from '../utils/logger';
 import { z } from 'zod';
@@ -11,7 +11,7 @@ const router = Router();
 
 export const passwordSchema = z
   .string()
-  .min(12, "Password must be at least 12 characters")
+  .min(8, "Password must be at least 8 characters")
   .max(128, "Password must be at most 128 characters")
   .regex(/^\S+$/, "Password must not contain spaces")
   .regex(/\p{Ll}/u, "Must include at least one lowercase letter")
@@ -20,13 +20,13 @@ export const passwordSchema = z
 
 const generateTokens = (userId: string, username: string) => {
   const accessToken = jwt.sign(
-    { userId, username },
+    { userId, username, token_use: 'access' },
     process.env.JWT_ACCESS_SECRET!,
     { expiresIn: '15m' }
   );
   
   const refreshToken = jwt.sign(
-    { userId, username },
+    { userId, username, token_use: 'refresh', jti: require('crypto').randomUUID() },
     process.env.JWT_REFRESH_SECRET!,
     { expiresIn: '7d' }
   );
@@ -54,6 +54,7 @@ router.post('/register', async (req: Request, res: Response) => {
       });
     }
     
+    const AppDataSource = await getInitializedDataSource();
     const userRepository = AppDataSource.getRepository(User);
     const existingUser = await userRepository.findOne({ where: { username } });
     
@@ -78,10 +79,7 @@ router.post('/register', async (req: Request, res: Response) => {
     logger.info(`User registered: ${username}`);
     
     const {id, passwordHash: passwrdHash, ...userWithoutPassword} = user;
-    const queryRunner = AppDataSource.createQueryRunner();
-    await queryRunner.connect();
-
-    await queryRunner.query(`SET app.current_user_id = $1`, [id]);
+    
     res.status(201).json({
       message: 'User created successfully',
       user: userWithoutPassword,
@@ -101,6 +99,7 @@ router.post('/login', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
     
+    const AppDataSource = await getInitializedDataSource();
     const userRepository = AppDataSource.getRepository(User);
     const user = await userRepository.findOne({ where: { username } });
     
@@ -120,7 +119,9 @@ router.post('/login', async (req: Request, res: Response) => {
     const queryRunner = AppDataSource.createQueryRunner();
     await queryRunner.connect();
 
-    await queryRunner.query(`SET app.current_user_id = $1`, [user.id]);
+    await queryRunner.query(`SELECT set_config('app.user_id', $1, true)`, [user.id.toString()]);
+    await queryRunner.release();
+    
     const {passwordHash, ...userWithoutPassword} = user;
     res.json({
       message: 'Login successful',
@@ -135,13 +136,144 @@ router.post('/login', async (req: Request, res: Response) => {
 });
 
 
+// Find user by username
+router.post('/find-by-username', async (req: Request, res: Response) => {
+  try {
+    const { username } = req.body;
+    
+    if (!username) {
+      return res.status(400).json({ error: 'Username is required' });
+    }
+    
+    const AppDataSource = await getInitializedDataSource();
+    const userRepository = AppDataSource.getRepository(User);
+    const user = await userRepository.findOne({ where: { username } });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const {passwordHash, ...userWithoutPassword} = user;
+    res.json({
+      user: userWithoutPassword
+    });
+  } catch (error) {
+    logger.error('Find user by username error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Search users with fuzzy matching
+router.post('/search-users', async (req: Request, res: Response) => {
+  try {
+    const { query, limit = 10 } = req.body;
+    
+    if (!query || query.trim().length < 2) {
+      return res.json({ users: [] });
+    }
+    
+    const AppDataSource = await getInitializedDataSource();
+    const userRepository = AppDataSource.getRepository(User);
+    
+    // Use ILIKE for case-insensitive partial matching
+    const users = await userRepository
+      .createQueryBuilder('user')
+      .select(['user.id', 'user.username'])
+      .where('user.username ILIKE :query', { query: `%${query}%` })
+      .orderBy('user.username', 'ASC')
+      .limit(limit)
+      .getMany();
+    
+    res.json({
+      users: users
+    });
+  } catch (error) {
+    logger.error('Search users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/refresh', async (req: Request, res: Response) => {
+  try {
+    const refreshToken = req.cookies.refreshToken;
+    
+    if (!refreshToken) {
+      return res.status(401).json({ 
+        code: 'missing_refresh', 
+        message: 'Refresh token not found' 
+      });
+    }
+
+    try {
+      const payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as any;
+      
+      // Verify token type
+      if (payload.token_use !== 'refresh') {
+        return res.status(401).json({ 
+          code: 'invalid_token_type', 
+          message: 'Invalid token type' 
+        });
+      }
+
+      // Re-load user from database to ensure claims are current
+      const AppDataSource = await getInitializedDataSource();
+      const userRepository = AppDataSource.getRepository(User);
+      const user = await userRepository.findOne({ where: { id: payload.userId } });
+
+      if (!user) {
+        return res.status(401).json({ 
+          code: 'user_not_found', 
+          message: 'User not found' 
+        });
+      }
+
+      // Generate new access token with current user data
+      const newAccessToken = jwt.sign(
+        { userId: user.id, username: user.username, token_use: 'access' },
+        process.env.JWT_ACCESS_SECRET!,
+        { expiresIn: '15m' }
+      );
+
+      // Set new access token in response header
+      res.setHeader('Authorization', `Bearer ${newAccessToken}`);
+      
+      logger.info(`Token refreshed for user: ${user.username}`);
+      
+      return res.json({ 
+        accessToken: newAccessToken,
+        message: 'Token refreshed successfully' 
+      });
+
+    } catch (jwtError: any) {
+      if (jwtError.name === 'TokenExpiredError') {
+        return res.status(401).json({ 
+          code: 'refresh_expired', 
+          message: 'Refresh token expired' 
+        });
+      }
+      return res.status(401).json({ 
+        code: 'invalid_refresh', 
+        message: 'Invalid refresh token' 
+      });
+    }
+
+  } catch (error) {
+    logger.error('Refresh error:', error);
+    res.status(500).json({ 
+      code: 'internal_error',
+      message: 'Internal server error' 
+    });
+  }
+});
+
 router.post('/logout', async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
+    const refreshToken = req.cookies.refreshToken;
     
     if (refreshToken) {
       // In a production app, you would blacklist the refresh token
-      // For now, we'll just return success
+      // For now, we'll just clear the cookie
+      res.clearCookie('refreshToken');
       logger.info('User logged out');
     }
     

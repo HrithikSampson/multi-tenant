@@ -9,7 +9,7 @@ import authRouter from './controller/auth.controller';
 import organizationRouter from './controller/organization.controller';
 import projectRouter from './controller/project.controller';
 import taskRouter from './controller/task.controller';
-import { createDataSource } from './config/database';
+import { AppDataSource } from './config/database';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,7 +23,7 @@ app.use(
 );
 
 app.use(cors({
-    origin: '*', // just for now
+    origin: '*',
 }));
 
 app.use(express.json());
@@ -39,8 +39,6 @@ app.get('/health', (_req, res) => {
 
   res.send('Health check OK');
 });
-
-const AppDataSource = createDataSource();
 
 AppDataSource.initialize()
   .then(() => {

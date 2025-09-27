@@ -1,3 +1,4 @@
+import 'reflect-metadata';
 import { DataSource } from 'typeorm';
 import { User } from '../entity/user.entity';
 import { Organization } from '../entity/organization.entity';
@@ -19,8 +20,15 @@ export const createDataSource = () => {
     migrations: ['src/migrations/*.ts'],
     synchronize: false,
     logging: process.env.NODE_ENV === 'development',
-    ssl: { rejectUnauthorized: false },
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   });
 };
 
 export const AppDataSource = createDataSource();
+
+export const getInitializedDataSource = async () => {
+  if (!AppDataSource.isInitialized) {
+    await AppDataSource.initialize();
+  }
+  return AppDataSource;
+};

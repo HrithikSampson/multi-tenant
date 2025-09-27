@@ -39,45 +39,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION app.user_in_org(org_id bigint)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM org_memberships m
-    WHERE m.organization_id = org_id
-      AND m.user_id = current_setting('app.user_id', true)::bigint
-  );
-$$;
-
-CREATE OR REPLACE FUNCTION app.is_org_admin(org_id bigint)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM org_memberships m
-    WHERE m.organization_id = org_id
-      AND m.user_id = current_setting('app.user_id', true)::bigint
-      AND m.role IN ('OWNER','ADMIN')
-  );
-$$;
-
-CREATE OR REPLACE FUNCTION app.is_project_editor(org_id bigint, proj_id bigint)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM project_members pm
-    WHERE pm.organization_id = org_id
-      AND pm.project_id = proj_id
-      AND pm.user_id = current_setting('app.user_id', true)::bigint
-      AND pm.role = 'EDITOR'
-  );
-$$;
-
 CREATE TABLE IF NOT EXISTS users (
   id              BIGSERIAL PRIMARY KEY,
   username        CITEXT NOT NULL UNIQUE,
@@ -196,6 +157,45 @@ CREATE TABLE IF NOT EXISTS activities (
   created_at      timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_activities_org_time ON activities (organization_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION app.user_in_org(org_id bigint)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM org_memberships m
+    WHERE m.organization_id = org_id
+      AND m.user_id = current_setting('app.user_id', true)::bigint
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION app.is_org_admin(org_id bigint)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM org_memberships m
+    WHERE m.organization_id = org_id
+      AND m.user_id = current_setting('app.user_id', true)::bigint
+      AND m.role IN ('OWNER','ADMIN')
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION app.is_project_editor(org_id bigint, proj_id bigint)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM project_members pm
+    WHERE pm.organization_id = org_id
+      AND pm.project_id = proj_id
+      AND pm.user_id = current_setting('app.user_id', true)::bigint
+      AND pm.role = 'EDITOR'
+  );
+$$;
 
 ALTER TABLE organizations      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE org_memberships    ENABLE ROW LEVEL SECURITY;

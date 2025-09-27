@@ -1,14 +1,15 @@
 import express, { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
-import { AppDataSource } from '../../data-source';
+import { AppDataSource } from '../../config/database';
 import { QueryRunner } from 'typeorm';
 
 const app = express();
 app.use(cookieParser());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey';
+const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET || 'supersecretkey';
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'supersecretkey';
 const ACCESS_EXPIRES_IN = '15m';
 const REFRESH_EXPIRES_IN = '7d';
 
@@ -27,16 +28,38 @@ interface AuthenticatedRequest extends Request {
 }
 
 export const generateAccessToken = (payload: object): string => {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_EXPIRES_IN });
+  return jwt.sign(payload, JWT_ACCESS_SECRET, { expiresIn: ACCESS_EXPIRES_IN });
 };
 
 export const generateRefreshToken = (payload: object): string => {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: REFRESH_EXPIRES_IN });
+  return jwt.sign(payload, JWT_REFRESH_SECRET, { expiresIn: REFRESH_EXPIRES_IN });
 };
 
 export const verifyToken = (token: string): JWTPayload => {
-  return jwt.verify(token, JWT_SECRET) as JWTPayload;
+  return jwt.verify(token, JWT_ACCESS_SECRET) as JWTPayload;
 };
+
+// RLS helper with transaction-local context
+async function withRls<T>(
+  queryRunner: QueryRunner,
+  userId: string,
+  organizationId: string | undefined,
+  fn: () => Promise<T>
+): Promise<T> {
+  await queryRunner.startTransaction();
+  try {
+    await queryRunner.query(`SELECT set_config('app.user_id', '${userId}', true)`);
+    if (organizationId) {
+      await queryRunner.query(`SELECT set_config('app.organization_id', '${organizationId}', true)`);
+    }
+    const result = await fn();
+    await queryRunner.commitTransaction();
+    return result;
+  } catch (e) {
+    await queryRunner.rollbackTransaction();
+    throw e;
+  }
+}
 
 async function setUserContextInDB(queryRunner: QueryRunner, userId: string, organizationId?: string): Promise<void> {
   // Always set user_id for basic user context
@@ -66,117 +89,49 @@ async function setUserContextInDB(queryRunner: QueryRunner, userId: string, orga
 
 export const jwtMiddleware = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
-  
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ message: 'Authorization header missing' });
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ code: 'missing_auth', message: 'Authorization header missing' });
   }
 
   const token = authHeader.split(' ')[1];
-  
+
+  let decoded: JWTPayload;
   try {
-    const decoded = verifyToken(token);
-    
-    if (!decoded.userId) {
-      return res.status(401).json({ 
-        message: 'Invalid token: missing user data' 
-      });
-    }
-
-    const queryRunner = AppDataSource.createQueryRunner();
-    await queryRunner.connect();
-
-    try {
-      // Always set user context, organization context comes from request
-      await setUserContextInDB(queryRunner, decoded.userId);
-      
-      req.user = decoded;
-      req.queryRunner = queryRunner;
-      req.accessToken = token;
-      
-      res.on('finish', () => {
-        if (req.queryRunner && !req.queryRunner.isReleased) {
-          req.queryRunner.release();
-        }
-      });
-
-      next();
-      
-    } catch (contextError) {
-      await queryRunner.release();
-      return res.status(403).json({ 
-        message: 'User authorization failed' 
-      });
-    }
-    
+    decoded = verifyToken(token);
   } catch (err: any) {
     if (err.name === 'TokenExpiredError') {
-      const refreshToken = req.cookies.refreshToken;
-      
-      if (refreshToken) {
-        try {
-          const refreshDecoded = verifyToken(refreshToken);
-          const newAccessToken = generateAccessToken(refreshDecoded as object);
-          
-          return res.status(200).json({ 
-            accessToken: newAccessToken,
-            message: 'Token refreshed successfully'
-          });
-        } catch (refreshErr) {
-          return res.status(403).json({ message: 'Invalid or expired refresh token' });
-        }
-      }
-      return res.status(401).json({ message: 'Access token expired' });
+      return res.status(401).json({ code: 'token_expired', message: 'Access token expired' });
     }
-    
-    return res.status(403).json({ message: 'Invalid access token' });
+    return res.status(401).json({ code: 'invalid_token', message: 'Invalid access token' });
   }
-};
 
-export const executeWithRLS = async (req: AuthenticatedRequest, query: string, params: any[] = []) => {
-  if (!req.queryRunner) {
-    throw new Error('No database connection available');
+  if (!decoded.userId) {
+    return res.status(401).json({ code: 'invalid_claims', message: 'Invalid token: missing user data' });
   }
-  
-  return await req.queryRunner.query(query, params);
-};
 
-export const hasOrgAccess = async (req: AuthenticatedRequest, organizationId: string): Promise<boolean> => {
-  if (!req.user || !req.queryRunner) {
-    return false;
-  }
-  
+  const queryRunner = AppDataSource.createQueryRunner();
   try {
-    const result = await executeWithRLS(req, `
-      SELECT EXISTS (
-        SELECT 1 FROM org_memberships 
-        WHERE user_id = $1 AND organization_id = $2
-      ) as has_access
-    `, [req.user.userId, organizationId]);
-    
-    return result[0]?.has_access || false;
-  } catch (error) {
-    return false;
+    await queryRunner.connect();
+    req.user = decoded;
+    req.queryRunner = queryRunner;
+    req.accessToken = token;
+
+    // IMPORTANT: do NOT set GUCs here globally; set them per-query via withRls()
+    // or run a request-scoped transaction & SET LOCAL if your handlers are disciplined.
+
+    // Ensure release in all cases
+    res.on('finish', async () => {
+      try { if (!queryRunner.isReleased) await queryRunner.release(); } catch {}
+    });
+
+    next();
+  } catch (e) {
+    try { if (!queryRunner.isReleased) await queryRunner.release(); } catch {}
+    return res.status(500).json({ code: 'db_connect_failed', message: 'DB connection failed' });
   }
 };
 
-export const hasProjectAccess = async (req: AuthenticatedRequest, projectId: string): Promise<boolean> => {
-  if (!req.user || !req.queryRunner) {
-    return false;
-  }
-  
-  try {
-    const result = await executeWithRLS(req, `
-      SELECT EXISTS (
-        SELECT 1 FROM project_members pm
-        WHERE pm.user_id = $1 AND pm.project_id = $2
-      ) as has_access
-    `, [req.user.userId, projectId]);
-    
-    return result[0]?.has_access || false;
-  } catch (error) {
-    return false;
-  }
-};
+
 
 export const getUserOrganizations = async (req: AuthenticatedRequest) => {
   if (!req.user || !req.queryRunner) {
@@ -217,6 +172,7 @@ export const switchOrganization = async (req: AuthenticatedRequest, organization
 
 export const setOrganizationContext = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const organizationId = req.headers['x-organization-id'] as string || req.body.organizationId;
+  console.log('setOrganizationContext:', { organizationId, hasQueryRunner: !!req.queryRunner });
   
   if (organizationId && req.queryRunner) {
     try {
@@ -233,6 +189,7 @@ export const setOrganizationContext = async (req: AuthenticatedRequest, res: Res
 };
 
 export const requireOrganization = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  console.log('requireOrganization:', { organizationId: req.organizationId });
   if (!req.organizationId) {
     return res.status(400).json({ 
       message: 'Organization context required. Please provide x-organization-id header or organizationId in body.' 
@@ -240,6 +197,61 @@ export const requireOrganization = async (req: AuthenticatedRequest, res: Respon
   }
   
   next();
+};
+
+export const executeWithRLS = async (
+  req: AuthenticatedRequest,
+  query: string,
+  params: any[] = []
+) => {
+  if (!req.queryRunner || !req.user) {
+    throw new Error('No DB connection or user context available');
+  }
+  
+  return withRls(req.queryRunner, req.user.userId, req.organizationId, () =>
+    req.queryRunner!.query(query, params)
+  );
+};
+
+export const hasOrgAccess = async (req: AuthenticatedRequest, organizationId: string): Promise<boolean> => {
+  if (!req.user || !req.queryRunner) {
+    return false;
+  }
+  
+  try {
+    const result = await req.queryRunner.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM org_memberships 
+        WHERE organization_id = $1 AND user_id = $2
+      ) as has_access
+    `, [organizationId, req.user.userId]);
+    
+    return result[0]?.has_access || false;
+  } catch (error) {
+    return false;
+  }
+};
+
+export const hasProjectAccess = async (req: AuthenticatedRequest, projectId: string): Promise<boolean> => {
+  if (!req.user || !req.queryRunner || !req.organizationId) {
+    return false;
+  }
+  
+  try {
+    const result = await req.queryRunner.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM projects p
+        LEFT JOIN project_members pm ON p.id = pm.project_id AND pm.user_id = $1
+        LEFT JOIN org_memberships om ON p.organization_id = om.organization_id AND om.user_id = $1
+        WHERE p.id = $2 AND p.organization_id = $3
+        AND (pm.user_id IS NOT NULL OR om.role IN ('OWNER', 'ADMIN'))
+      ) as has_access
+    `, [req.user.userId, projectId, req.organizationId]);
+    
+    return result[0]?.has_access || false;
+  } catch (error) {
+    return false;
+  }
 };
 
 

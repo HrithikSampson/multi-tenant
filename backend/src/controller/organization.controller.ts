@@ -29,8 +29,14 @@ router.post('/', async (req: any, res: Response) => {
       });
     }
 
-    // Check if subdomain is already taken
-    const existingOrg = await executeWithRLS(req, `
+    if (!req.queryRunner) {
+      return res.status(500).json({ 
+        message: 'Database connection not available' 
+      });
+    }
+
+    // Check if subdomain is already taken (without RLS since we're creating)
+    const existingOrg = await req.queryRunner.query(`
       SELECT id FROM organizations WHERE subdomain = $1
     `, [subdomain]);
 
@@ -40,8 +46,8 @@ router.post('/', async (req: any, res: Response) => {
       });
     }
 
-    // Create organization
-    const result = await executeWithRLS(req, `
+    // Create organization (without RLS since we're creating)
+    const result = await req.queryRunner.query(`
       INSERT INTO organizations (name, subdomain)
       VALUES ($1, $2)
       RETURNING id, name, subdomain, created_at
@@ -49,8 +55,8 @@ router.post('/', async (req: any, res: Response) => {
 
     const organization = result[0];
 
-    // Add user as owner of the organization
-    await executeWithRLS(req, `
+    // Add user as owner of the organization (without RLS since we're creating)
+    await req.queryRunner.query(`
       INSERT INTO org_memberships (organization_id, user_id, role)
       VALUES ($1, $2, 'OWNER')
     `, [organization.id, req.user!.userId]);
@@ -272,6 +278,13 @@ router.put('/:organizationId/members/:userId', setOrganizationContext as any, re
     if (currentUserRole.length === 0 || !['OWNER', 'ADMIN'].includes(currentUserRole[0].role)) {
       return res.status(403).json({ 
         message: 'Only OWNER or ADMIN can update member roles' 
+      });
+    }
+
+    // OWNER cannot change their own role
+    if (req.user!.userId === userId) {
+      return res.status(403).json({ 
+        message: 'You cannot change your own role' 
       });
     }
 
