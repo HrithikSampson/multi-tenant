@@ -1,261 +1,440 @@
-import { Router, Request, Response } from 'express';
-import { AppDataSource } from '../config/database';
-import { Organization } from '../entity/organization.entity';
-import { OrgMembership } from '../entity/org-membership.entity';
-import { User } from '../entity/user.entity';
-import { Activity } from '../entity/activity.entity';
-import { ActivityKind, OrgRole } from '../db/enums';
-import { authenticateToken, requireOrganizationAccess, requireAdminAccess } from '../utils/middleware/auth.middleware';
-import logger from '../utils/logger';
+import express, { Request, Response } from 'express';
+import { jwtMiddleware, setOrganizationContext, requireOrganization, executeWithRLS, getUserOrganizations, switchOrganization } from '../utils/middleware/jwtMiddleWare';
 
-const router = Router();
-
-interface AuthRequest extends Request {
+interface AuthenticatedRequest extends Request {
   user?: {
-    id: string;
-    username: string;
-    organizationId?: string;
-    role?: string;
+    userId: string;
+    username?: string;
+    iat?: number;
+    exp?: number;
   };
+  queryRunner?: any;
+  accessToken?: string;
+  organizationId?: string;
 }
 
-router.post('/create', authenticateToken, async (req: AuthRequest, res: Response) => {
+const router = express.Router();
+
+// Apply JWT middleware to all routes
+router.use(jwtMiddleware as any);
+
+// 1. Create organization
+router.post('/', async (req: any, res: Response) => {
   try {
     const { name, subdomain } = req.body;
     
     if (!name || !subdomain) {
-      return res.status(400).json({ error: 'Name and subdomain are required' });
+      return res.status(400).json({ 
+        message: 'Name and subdomain are required' 
+      });
     }
-    
-    const organizationRepository = AppDataSource.getRepository(Organization);
-    const existingOrg = await organizationRepository.findOne({ where: { subdomain } });
-    
-    if (existingOrg) {
-      return res.status(400).json({ error: 'Subdomain already exists' });
+
+    // Check if subdomain is already taken
+    const existingOrg = await executeWithRLS(req, `
+      SELECT id FROM organizations WHERE subdomain = $1
+    `, [subdomain]);
+
+    if (existingOrg.length > 0) {
+      return res.status(409).json({ 
+        message: 'Subdomain already exists' 
+      });
     }
-    
-    const organization = organizationRepository.create({
-      name,
-      subdomain
-    });
-    
-    await organizationRepository.save(organization);
-    
-    const membershipRepository = AppDataSource.getRepository(OrgMembership);
-    const membership = membershipRepository.create({
-      organizationId: organization.id,
-      userId: req.user!.id,
-      role: OrgRole.OWNER
-    });
-    
-    await membershipRepository.save(membership);
-    
-    const activityRepository = AppDataSource.getRepository(Activity);
-    const activity = activityRepository.create({
-      organizationId: organization.id,
-      actorId: req.user!.id,
-      kind: ActivityKind.ANNOUNCE,
-      message: `${req.user!.username} created organization "${name}"`,
-      objectType: 'organization',
-      objectId: organization.id
-    });
-    
-    await activityRepository.save(activity);
-    
-    logger.info(`Organization created: ${name} by ${req.user!.username}`);
-    
+
+    // Create organization
+    const result = await executeWithRLS(req, `
+      INSERT INTO organizations (name, subdomain)
+      VALUES ($1, $2)
+      RETURNING id, name, subdomain, created_at
+    `, [name, subdomain]);
+
+    const organization = result[0];
+
+    // Add user as owner of the organization
+    await executeWithRLS(req, `
+      INSERT INTO org_memberships (organization_id, user_id, role)
+      VALUES ($1, $2, 'OWNER')
+    `, [organization.id, req.user!.userId]);
+
     res.status(201).json({
-      message: 'Organization created successfully',
-      organization: {
-        id: organization.id,
-        name: organization.name,
-        subdomain: organization.subdomain,
-        roomKey: organization.roomKey,
-        createdAt: organization.createdAt
-      }
+      organization,
+      message: 'Organization created successfully'
     });
-  } catch (error) {
-    logger.error('Create organization error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+
+  } catch (error: any) {
+    console.error('Error creating organization:', error);
+    res.status(500).json({ 
+      message: 'Failed to create organization' 
+    });
   }
 });
 
-router.post('/join', authenticateToken, async (req: AuthRequest, res: Response) => {
+// 2. List all organizations user is part of
+router.get('/', async (req: any, res: Response) => {
   try {
-    const { organizationId } = req.body;
+    const organizations = await getUserOrganizations(req);
+    
+    res.json({
+      organizations,
+      count: organizations.length
+    });
+
+  } catch (error: any) {
+    console.error('Error fetching organizations:', error);
+    res.status(500).json({ 
+      message: 'Failed to fetch organizations' 
+    });
+  }
+});
+
+// 3. Switch to a workspace/connect to a workspace
+router.post('/switch/:organizationId', async (req: any, res: Response) => {
+  try {
+    const { organizationId } = req.params;
     
     if (!organizationId) {
-      return res.status(400).json({ error: 'Organization ID is required' });
+      return res.status(400).json({ 
+        message: 'Organization ID is required' 
+      });
     }
-    
-    const organizationRepository = AppDataSource.getRepository(Organization);
-    const organization = await organizationRepository.findOne({ where: { id: organizationId } });
-    
-    if (!organization) {
-      return res.status(404).json({ error: 'Organization not found' });
-    }
-    
-    const membershipRepository = AppDataSource.getRepository(OrgMembership);
-    const existingMembership = await membershipRepository.findOne({
-      where: {
-        organizationId,
-        userId: req.user!.id
-      }
-    });
-    
-    if (existingMembership) {
-      return res.status(400).json({ error: 'Already a member of this organization' });
-    }
-    
-    const membership = membershipRepository.create({
-      organizationId,
-      userId: req.user!.id,
-      role: OrgRole.USER
-    });
-    
-    await membershipRepository.save(membership);
-    
-    const activityRepository = AppDataSource.getRepository(Activity);
-    const activity = activityRepository.create({
-      organizationId,
-      actorId: req.user!.id,
-      kind: ActivityKind.NOTIFY,
-      message: `${req.user!.username} joined the organization`,
-      objectType: 'membership',
-      objectId: membership.organizationId
-    });
-    
-    await activityRepository.save(activity);
-    
-    logger.info(`User ${req.user!.username} joined organization ${organizationId}`);
-    
-    res.status(201).json({
-      message: 'Successfully joined organization',
-      organization: {
-        id: organization.id,
-        name: organization.name,
-        subdomain: organization.subdomain
-      }
-    });
-  } catch (error) {
-    logger.error('Join organization error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
-router.get('/:organizationId', authenticateToken, requireOrganizationAccess, async (req: AuthRequest, res: Response) => {
-  try {
-    const organizationRepository = AppDataSource.getRepository(Organization);
-    const organization = await organizationRepository.findOne({
-      where: { id: req.params.organizationId },
-      relations: ['memberships', 'memberships.user', 'projects']
-    });
-    
-    if (!organization) {
-      return res.status(404).json({ error: 'Organization not found' });
-    }
-    
-    const members = organization.memberships?.map(membership => ({
-      id: membership.user.id,
-      username: membership.user.username,
-      role: membership.role,
-      joinedAt: membership.createdAt
-    })) || [];
-    
-    const projects = organization.projects?.map(project => ({
-      id: project.id,
-      name: project.name,
-      slug: project.slug,
-      createdAt: project.createdAt
-    })) || [];
-    
+    await switchOrganization(req, organizationId);
+
     res.json({
-      organization: {
-        id: organization.id,
-        name: organization.name,
-        subdomain: organization.subdomain,
-        roomKey: organization.roomKey,
-        createdAt: organization.createdAt
-      },
+      message: 'Successfully switched to organization',
+      organizationId: req.organizationId
+    });
+
+  } catch (error: any) {
+    console.error('Error switching organization:', error);
+    res.status(403).json({ 
+      message: error.message || 'Failed to switch organization' 
+    });
+  }
+});
+
+// Additional endpoint: Get current organization context
+router.get('/current', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
+  try {
+    const organization = await executeWithRLS(req, `
+      SELECT o.id, o.name, o.subdomain, om.role
+      FROM organizations o
+      JOIN org_memberships om ON o.id = om.organization_id
+      WHERE o.id = $1 AND om.user_id = $2
+    `, [req.organizationId, req.user!.userId]);
+
+    if (organization.length === 0) {
+      return res.status(404).json({ 
+        message: 'Organization not found or access denied' 
+      });
+    }
+
+    res.json({
+      organization: organization[0]
+    });
+
+  } catch (error: any) {
+    console.error('Error fetching current organization:', error);
+    res.status(500).json({ 
+      message: 'Failed to fetch current organization' 
+    });
+  }
+});
+
+// Add member to organization (OWNER/ADMIN only)
+router.post('/:organizationId/members', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
+  try {
+    const { organizationId } = req.params;
+    const { userId, role = 'USER' } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ 
+        message: 'User ID is required' 
+      });
+    }
+
+    // Check if current user is OWNER or ADMIN
+    const currentUserRole = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, req.user!.userId]);
+
+    if (currentUserRole.length === 0 || !['OWNER', 'ADMIN'].includes(currentUserRole[0].role)) {
+      return res.status(403).json({ 
+        message: 'Only OWNER or ADMIN can add members' 
+      });
+    }
+
+    // Check if user exists
+    const userExists = await executeWithRLS(req, `
+      SELECT id FROM users WHERE id = $1
+    `, [userId]);
+
+    if (userExists.length === 0) {
+      return res.status(404).json({ 
+        message: 'User not found' 
+      });
+    }
+
+    // Check if user is already a member
+    const existingMembership = await executeWithRLS(req, `
+      SELECT id FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, userId]);
+
+    if (existingMembership.length > 0) {
+      return res.status(409).json({ 
+        message: 'User is already a member of this organization' 
+      });
+    }
+
+    // Add user to organization
+    await executeWithRLS(req, `
+      INSERT INTO org_memberships (organization_id, user_id, role)
+      VALUES ($1, $2, $3)
+    `, [organizationId, userId, role]);
+
+    res.status(201).json({
+      message: 'Member added successfully',
+      organizationId,
+      userId,
+      role
+    });
+
+  } catch (error: any) {
+    console.error('Error adding member:', error);
+    res.status(500).json({ 
+      message: 'Failed to add member' 
+    });
+  }
+});
+
+// List organization members (OWNER/ADMIN only)
+router.get('/:organizationId/members', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
+  try {
+    const { organizationId } = req.params;
+    
+    // Check if current user is OWNER or ADMIN
+    const currentUserRole = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, req.user!.userId]);
+
+    if (currentUserRole.length === 0 || !['OWNER', 'ADMIN'].includes(currentUserRole[0].role)) {
+      return res.status(403).json({ 
+        message: 'Only OWNER or ADMIN can view members' 
+      });
+    }
+
+    // Get all members
+    const members = await executeWithRLS(req, `
+      SELECT 
+        u.id,
+        u.username,
+        om.role,
+        om.created_at as joined_at
+      FROM org_memberships om
+      JOIN users u ON u.id = om.user_id
+      WHERE om.organization_id = $1
+      ORDER BY om.created_at DESC
+    `, [organizationId]);
+
+    res.json({
       members,
-      projects
+      count: members.length
     });
-  } catch (error) {
-    logger.error('Get organization error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+
+  } catch (error: any) {
+    console.error('Error fetching members:', error);
+    res.status(500).json({ 
+      message: 'Failed to fetch members' 
+    });
   }
 });
 
-router.get('/:organizationId/members', authenticateToken, requireOrganizationAccess, async (req: AuthRequest, res: Response) => {
+// Update member role (OWNER/ADMIN only)
+router.put('/:organizationId/members/:userId', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
   try {
-    const membershipRepository = AppDataSource.getRepository(OrgMembership);
-    const memberships = await membershipRepository.find({
-      where: { organizationId: req.params.organizationId },
-      relations: ['user']
-    });
-    
-    const members = memberships.map(membership => ({
-      id: membership.user.id,
-      username: membership.user.username,
-      role: membership.role,
-      joinedAt: membership.createdAt
-    }));
-    
-    res.json({ members });
-  } catch (error) {
-    logger.error('Get organization members error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-router.put('/:organizationId/members/:userId/role', authenticateToken, requireOrganizationAccess, requireAdminAccess, async (req: AuthRequest, res: Response) => {
-  try {
-    const { role } = req.body;
     const { organizationId, userId } = req.params;
+    const { role } = req.body;
     
     if (!role || !['OWNER', 'ADMIN', 'USER'].includes(role)) {
-      return res.status(400).json({ error: 'Invalid role' });
+      return res.status(400).json({ 
+        message: 'Valid role is required (OWNER, ADMIN, USER)' 
+      });
     }
-    
-    const membershipRepository = AppDataSource.getRepository(OrgMembership);
-    const membership = await membershipRepository.findOne({
-      where: {
-        organizationId,
-        userId
+
+    // Check if current user is OWNER or ADMIN
+    const currentUserRole = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, req.user!.userId]);
+
+    if (currentUserRole.length === 0 || !['OWNER', 'ADMIN'].includes(currentUserRole[0].role)) {
+      return res.status(403).json({ 
+        message: 'Only OWNER or ADMIN can update member roles' 
+      });
+    }
+
+    // ADMIN cannot promote to OWNER or demote OWNER
+    if (currentUserRole[0].role === 'ADMIN') {
+      if (role === 'OWNER') {
+        return res.status(403).json({ 
+          message: 'ADMIN cannot promote users to OWNER' 
+        });
       }
-    });
-    
-    if (!membership) {
-      return res.status(404).json({ error: 'Membership not found' });
+      
+      const targetUserRole = await executeWithRLS(req, `
+        SELECT role FROM org_memberships 
+        WHERE organization_id = $1 AND user_id = $2
+      `, [organizationId, userId]);
+      
+      if (targetUserRole.length > 0 && targetUserRole[0].role === 'OWNER') {
+        return res.status(403).json({ 
+          message: 'ADMIN cannot modify OWNER role' 
+        });
+      }
     }
-    
-    membership.role = role as OrgRole;
-    await membershipRepository.save(membership);
-    
-    const activityRepository = AppDataSource.getRepository(Activity);
-    const activity = activityRepository.create({
-      organizationId,
-      actorId: req.user!.id,
-      kind: ActivityKind.NOTIFY,
-      message: `${req.user!.username} updated role to ${role}`,
-      objectType: 'membership',
-      objectId: membership.organizationId
-    });
-    
-    await activityRepository.save(activity);
-    
-    logger.info(`Role updated for user ${userId} in organization ${organizationId}`);
-    
+
+    // Update member role
+    await executeWithRLS(req, `
+      UPDATE org_memberships 
+      SET role = $1, updated_at = now()
+      WHERE organization_id = $2 AND user_id = $3
+    `, [role, organizationId, userId]);
+
     res.json({
-      message: 'Role updated successfully',
-      membership: {
-        userId: membership.userId,
-        role: membership.role
-      }
+      message: 'Member role updated successfully',
+      organizationId,
+      userId,
+      role
     });
-  } catch (error) {
-    logger.error('Update member role error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+
+  } catch (error: any) {
+    console.error('Error updating member role:', error);
+    res.status(500).json({ 
+      message: 'Failed to update member role' 
+    });
+  }
+});
+
+// Remove member from organization (OWNER/ADMIN only)
+router.delete('/:organizationId/members/:userId', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
+  try {
+    const { organizationId, userId } = req.params;
+    
+    // Check if current user is OWNER or ADMIN
+    const currentUserRole = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, req.user!.userId]);
+
+    if (currentUserRole.length === 0 || !['OWNER', 'ADMIN'].includes(currentUserRole[0].role)) {
+      return res.status(403).json({ 
+        message: 'Only OWNER or ADMIN can remove members' 
+      });
+    }
+
+    // Check if target user exists in organization
+    const targetUser = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, userId]);
+
+    if (targetUser.length === 0) {
+      return res.status(404).json({ 
+        message: 'User is not a member of this organization' 
+      });
+    }
+
+    // ADMIN cannot remove OWNER
+    if (currentUserRole[0].role === 'ADMIN' && targetUser[0].role === 'OWNER') {
+      return res.status(403).json({ 
+        message: 'ADMIN cannot remove OWNER' 
+      });
+    }
+
+    // OWNER cannot remove themselves (prevent lockout)
+    if (req.user!.userId === userId && targetUser[0].role === 'OWNER') {
+      return res.status(403).json({ 
+        message: 'OWNER cannot remove themselves. Transfer ownership first.' 
+      });
+    }
+
+    // Remove member
+    await executeWithRLS(req, `
+      DELETE FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, userId]);
+
+    res.json({
+      message: 'Member removed successfully',
+      organizationId,
+      userId
+    });
+
+  } catch (error: any) {
+    console.error('Error removing member:', error);
+    res.status(500).json({ 
+      message: 'Failed to remove member' 
+    });
+  }
+});
+
+// Transfer ownership (OWNER only)
+router.post('/:organizationId/transfer-ownership', setOrganizationContext as any, requireOrganization as any, async (req: any, res: Response) => {
+  try {
+    const { organizationId } = req.params;
+    const { newOwnerId } = req.body;
+    
+    if (!newOwnerId) {
+      return res.status(400).json({ 
+        message: 'New owner ID is required' 
+      });
+    }
+
+    // Check if current user is OWNER
+    const currentUserRole = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, req.user!.userId]);
+
+    if (currentUserRole.length === 0 || currentUserRole[0].role !== 'OWNER') {
+      return res.status(403).json({ 
+        message: 'Only OWNER can transfer ownership' 
+      });
+    }
+
+    // Check if new owner is a member
+    const newOwner = await executeWithRLS(req, `
+      SELECT role FROM org_memberships 
+      WHERE organization_id = $1 AND user_id = $2
+    `, [organizationId, newOwnerId]);
+
+    if (newOwner.length === 0) {
+      return res.status(404).json({ 
+        message: 'New owner must be a member of the organization' 
+      });
+    }
+
+    // Transfer ownership
+    await executeWithRLS(req, `
+      BEGIN;
+      UPDATE org_memberships SET role = 'ADMIN' WHERE organization_id = $1 AND user_id = $2;
+      UPDATE org_memberships SET role = 'OWNER' WHERE organization_id = $1 AND user_id = $3;
+      COMMIT;
+    `, [organizationId, req.user!.userId, newOwnerId]);
+
+    res.json({
+      message: 'Ownership transferred successfully',
+      organizationId,
+      newOwnerId
+    });
+
+  } catch (error: any) {
+    console.error('Error transferring ownership:', error);
+    res.status(500).json({ 
+      message: 'Failed to transfer ownership' 
+    });
   }
 });
 

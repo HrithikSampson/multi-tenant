@@ -1,22 +1,22 @@
+import 'reflect-metadata';
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { AppDataSource } from '../config/database';
 import { User } from '../entity/user.entity';
-import { OrgMembership } from '../entity/org-membership.entity';
-import { Organization } from '../entity/organization.entity';
-import { Activity } from '../entity/activity.entity';
-import { ActivityKind } from '../db/enums';
 import logger from '../utils/logger';
+import { z } from 'zod';
 
 const router = Router();
 
-interface AuthRequest extends Request {
-  user?: {
-    id: string;
-    username: string;
-  };
-}
+export const passwordSchema = z
+  .string()
+  .min(12, "Password must be at least 12 characters")
+  .max(128, "Password must be at most 128 characters")
+  .regex(/^\S+$/, "Password must not contain spaces")
+  .regex(/\p{Ll}/u, "Must include at least one lowercase letter")
+  .regex(/\p{Lu}/u, "Must include at least one uppercase letter")
+  .regex(/\p{Nd}/u, "Must include at least one digit");
 
 const generateTokens = (userId: string, username: string) => {
   const accessToken = jwt.sign(
@@ -42,8 +42,16 @@ router.post('/register', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
     
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const checkPasswordParse = passwordSchema.safeParse(password);
+
+    if (!checkPasswordParse.success) {
+      return res.status(400).json({
+        message: "Validation failed",
+        errors: checkPasswordParse.error.issues.map((err) => ({
+          field: err.path.join("."),
+          message: err.message,
+        })),
+      });
     }
     
     const userRepository = AppDataSource.getRepository(User);
@@ -62,18 +70,22 @@ router.post('/register', async (req: Request, res: Response) => {
     await userRepository.save(user);
     
     const { accessToken, refreshToken } = generateTokens(user.id, user.username);
-    
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'strict'
+    });
     logger.info(`User registered: ${username}`);
     
+    const {id, passwordHash: passwrdHash, ...userWithoutPassword} = user;
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+
+    await queryRunner.query(`SET app.current_user_id = $1`, [id]);
     res.status(201).json({
       message: 'User created successfully',
-      user: {
-        id: user.id,
-        username: user.username,
-        createdAt: user.createdAt
-      },
-      accessToken,
-      refreshToken
+      user: userWithoutPassword,
+      accessToken
     });
   } catch (error) {
     logger.error('Registration error:', error);
@@ -105,14 +117,14 @@ router.post('/login', async (req: Request, res: Response) => {
     const { accessToken, refreshToken } = generateTokens(user.id, user.username);
     
     logger.info(`User logged in: ${username}`);
-    
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+
+    await queryRunner.query(`SET app.current_user_id = $1`, [user.id]);
+    const {passwordHash, ...userWithoutPassword} = user;
     res.json({
       message: 'Login successful',
-      user: {
-        id: user.id,
-        username: user.username,
-        createdAt: user.createdAt
-      },
+      user: userWithoutPassword,
       accessToken,
       refreshToken
     });
@@ -122,37 +134,6 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/refresh', async (req: Request, res: Response) => {
-  try {
-    const { refreshToken } = req.body;
-    
-    if (!refreshToken) {
-      return res.status(401).json({ error: 'Refresh token is required' });
-    }
-    
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as any;
-    
-    const userRepository = AppDataSource.getRepository(User);
-    const user = await userRepository.findOne({ where: { id: decoded.userId } });
-    
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid refresh token' });
-    }
-    
-    const { accessToken, refreshToken: newRefreshToken } = generateTokens(user.id, user.username);
-    
-    logger.info(`Token refreshed for user: ${user.username}`);
-    
-    res.json({
-      message: 'Token refreshed successfully',
-      accessToken,
-      refreshToken: newRefreshToken
-    });
-  } catch (error) {
-    logger.error('Token refresh error:', error);
-    res.status(401).json({ error: 'Invalid refresh token' });
-  }
-});
 
 router.post('/logout', async (req: Request, res: Response) => {
   try {
@@ -167,44 +148,6 @@ router.post('/logout', async (req: Request, res: Response) => {
     res.json({ message: 'Logout successful' });
   } catch (error) {
     logger.error('Logout error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-router.get('/me', async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-    
-    const userRepository = AppDataSource.getRepository(User);
-    const user = await userRepository.findOne({ 
-      where: { id: req.user.id },
-      relations: ['memberships', 'memberships.organization']
-    });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const organizations = user.memberships?.map(membership => ({
-      id: membership.organization.id,
-      name: membership.organization.name,
-      subdomain: membership.organization.subdomain,
-      role: membership.role,
-      joinedAt: membership.createdAt
-    })) || [];
-    
-    res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        createdAt: user.createdAt
-      },
-      organizations
-    });
-  } catch (error) {
-    logger.error('Get user profile error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
